@@ -1,0 +1,6 @@
+pandas>=2.2
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1
+pyodbc>=5.1
+pywin32>=306; platform_system == "Windows"
+pyreadstat>=1.2
