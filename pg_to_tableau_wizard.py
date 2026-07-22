@@ -713,6 +713,7 @@ class AccessExportApp:
         self._load_settings()
         self._build_ui()
         self.format_var.trace_add("write", self._on_format_changed)
+        self.table_var.trace_add("write", self._on_table_changed)
         self.root.after(150, self._drain_queue)
 
     def _build_ui(self) -> None:
@@ -886,6 +887,27 @@ class AccessExportApp:
         path = Path(current)
         if path.suffix.casefold() in {".accdb", ".sav"}:
             self.output_var.set(str(path.with_suffix(f".{self.format_var.get()}")))
+
+    def _on_table_changed(self, *_args: Any) -> None:
+        label = self.table_var.get().strip()
+        table = self.tables_by_label.get(label)
+        if table is None:
+            return
+
+        current = self.output_var.get().strip()
+        if current and not self._looks_like_generated_output(Path(current)):
+            return
+
+        base_dir = Path(current).expanduser().parent if current else Path.cwd()
+        self.output_var.set(
+            str(base_dir / make_timestamped_output_name(table.name, self.format_var.get()))
+        )
+
+    def _looks_like_generated_output(self, path: Path) -> bool:
+        suffix = path.suffix.casefold()
+        if suffix not in {".accdb", ".sav"}:
+            return False
+        return bool(re.fullmatch(r".+_\d{8}_\d{6}", path.stem))
 
     def _start_worker(self, target: Callable[[], None]) -> None:
         if self.worker and self.worker.is_alive():
