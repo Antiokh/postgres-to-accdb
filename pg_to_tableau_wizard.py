@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import lzma
 import math
 import os
 import queue
 import re
 import threading
+import time as time_module
 import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
@@ -186,7 +188,7 @@ def load_saved_settings() -> dict[str, str]:
     return {
         key: str(raw)
         for key, raw in value.items()
-        if key in {"host", "port", "database", "username", "format"}
+        if key in {"host", "port", "database", "username", "format", "compress"}
     }
 
 
@@ -197,6 +199,7 @@ def save_settings(
     database: str,
     username: str,
     output_format: str,
+    compress_output: bool,
 ) -> None:
     CONFIG_PATH.write_text(
         json.dumps(
@@ -206,6 +209,7 @@ def save_settings(
                 "database": database,
                 "username": username,
                 "format": output_format,
+                "compress": compress_output,
             },
             indent=2,
         ),
@@ -586,6 +590,56 @@ def make_timestamped_output_name(table_name: str, output_format: str) -> str:
     return f"{safe_name}_{stamp}.{output_format}"
 
 
+def compress_with_py7zr(
+    source_path: Path,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> Path:
+    try:
+        import py7zr
+    except ImportError as exc:
+        raise ExportError("py7zr is not installed.") from exc
+
+    archive_path = source_path.with_suffix(source_path.suffix + ".7z")
+    source_size = max(1, source_path.stat().st_size)
+    if archive_path.exists():
+        archive_path.unlink()
+
+    done = threading.Event()
+    failure: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            filters = [
+                {
+                    "id": py7zr.FILTER_LZMA2,
+                    "preset": 9 | lzma.PRESET_EXTREME,
+                }
+            ]
+            with py7zr.SevenZipFile(archive_path, mode="w", filters=filters) as archive:
+                archive.write(source_path, arcname=source_path.name)
+        except BaseException as exc:  # pragma: no cover - propagated to caller
+            failure.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    while not done.wait(0.2):
+        archive_size = archive_path.stat().st_size if archive_path.exists() else 0
+        percent = min(95, int((archive_size / source_size) * 95))
+        if progress_callback:
+            progress_callback(percent, 100, f"Compressing to 7z... {percent}%")
+        time_module.sleep(0.05)
+
+    thread.join()
+    if failure:
+        raise ExportError(f"7z compression failed: {failure[0]}")
+    if progress_callback:
+        progress_callback(100, 100, f"Compression finished: {archive_path.name}")
+    return archive_path
+
+
 class Checklist(ttk.LabelFrame):
     def __init__(self, master: Any, *, title: str) -> None:
         super().__init__(master, text=title, padding=8)
@@ -652,6 +706,7 @@ class AccessExportApp:
         self.password_var = tk.StringVar(value="postgres")
         self.table_var = tk.StringVar()
         self.format_var = tk.StringVar(value="accdb")
+        self.compress_var = tk.BooleanVar(value=False)
         self.output_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Enter connection details, then click Connect.")
 
@@ -727,13 +782,15 @@ class AccessExportApp:
         export_frame.columnconfigure(1, weight=1)
 
         ttk.Label(export_frame, text="Format").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(
+        format_buttons = ttk.Frame(export_frame)
+        format_buttons.grid(row=0, column=1, sticky="w", padx=(8, 8))
+        ttk.Radiobutton(format_buttons, text="ACCDB", value="accdb", variable=self.format_var).pack(side="left")
+        ttk.Radiobutton(format_buttons, text="SAV", value="sav", variable=self.format_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
             export_frame,
-            textvariable=self.format_var,
-            values=("accdb", "sav"),
-            state="readonly",
-            width=10,
-        ).grid(row=0, column=1, sticky="w", padx=(8, 8))
+            text="Compress to .7z after export (high compression)",
+            variable=self.compress_var,
+        ).grid(row=0, column=2, sticky="w")
         ttk.Label(export_frame, text="Output file").grid(row=1, column=0, sticky="w")
         ttk.Entry(export_frame, textvariable=self.output_var).grid(row=1, column=1, sticky="ew", padx=(8, 8))
         ttk.Button(export_frame, text="Browse", command=self.browse_output).grid(row=1, column=2, sticky="ew")
@@ -758,6 +815,8 @@ class AccessExportApp:
             self.user_var.set(saved["username"])
         if saved.get("format") in {"accdb", "sav"}:
             self.format_var.set(saved["format"])
+        if str(saved.get("compress", "")).lower() in {"true", "1", "yes"}:
+            self.compress_var.set(True)
 
     def _connection_kwargs(self) -> dict[str, Any]:
         try:
@@ -814,6 +873,8 @@ class AccessExportApp:
         if not output_text:
             self.output_var.set(str(Path.cwd() / make_timestamped_output_name(table.name, self.format_var.get())))
             output_text = self.output_var.get()
+        elif not Path(output_text).suffix:
+            self.output_var.set(str(Path(output_text).with_suffix(f".{self.format_var.get()}")))
         self.status_var.set("Export in progress...")
         self.progress.configure(value=0)
         self._start_worker(self._export_worker)
@@ -868,6 +929,7 @@ class AccessExportApp:
 
             output_path = Path(self.output_var.get().strip()).expanduser().resolve()
             output_format = output_path.suffix.casefold().lstrip(".") or self.format_var.get()
+            archive_path: Path | None = None
             engine = build_engine(**self._connection_kwargs())
             try:
                 if output_format == "sav":
@@ -891,8 +953,10 @@ class AccessExportApp:
                     )
             finally:
                 engine.dispose()
+            if self.compress_var.get():
+                archive_path = compress_with_py7zr(output_path, progress_callback=self._queue_progress)
             self._save_settings()
-            self.message_queue.put(("done", (exported, output_path)))
+            self.message_queue.put(("done", (exported, output_path, archive_path)))
         except Exception as exc:
             details = traceback.format_exc()
             self.message_queue.put(("error", f"{exc}\n\n{details}"))
@@ -905,6 +969,7 @@ class AccessExportApp:
                 database=self.db_var.get().strip() or "postgres",
                 username=self.user_var.get().strip() or "postgres",
                 output_format=self.format_var.get(),
+                compress_output=self.compress_var.get(),
             )
         except OSError:
             pass
@@ -941,11 +1006,17 @@ class AccessExportApp:
                     self.progress.configure(value=percent)
                     self.status_var.set(status)
                 elif kind == "done":
-                    exported, output_path = payload
+                    exported, output_path, archive_path = payload
                     self.progress.configure(value=100)
-                    self.status_var.set(f"Finished export: {exported:,} rows -> {output_path}")
+                    message = f"Finished export: {exported:,} rows -> {output_path}"
+                    if archive_path is not None:
+                        message += f" | 7z: {archive_path}"
+                    self.status_var.set(message)
                     if messagebox is not None:
-                        messagebox.showinfo("Export complete", f"Exported {exported:,} rows to:\n{output_path}")
+                        dialog_text = f"Exported {exported:,} rows to:\n{output_path}"
+                        if archive_path is not None:
+                            dialog_text += f"\n\nCompressed archive:\n{archive_path}"
+                        messagebox.showinfo("Export complete", dialog_text)
                 elif kind == "error":
                     self.status_var.set("Operation failed.")
                     self._show_error(str(payload))
