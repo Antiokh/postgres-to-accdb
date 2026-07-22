@@ -24,6 +24,7 @@ import math
 import os
 import re
 import sys
+import traceback
 import uuid
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -250,16 +251,42 @@ def first_non_null(series: pd.Series) -> Any:
     return None
 
 
-def infer_access_type(series: pd.Series) -> str:
+def infer_access_integer_type(series: pd.Series) -> str:
+    """
+    Pick an Access integer type from the values present in the first chunk.
+
+    PostgreSQL int4 maps exactly to Access INTEGER (signed 32-bit). Access has no
+    native signed 64-bit integer field in the classic engine, so larger values
+    fall back to ODBC NUMERIC.
+    """
+    non_null = series.dropna()
+    if non_null.empty:
+        return "INTEGER"
+
+    try:
+        minimum = int(non_null.min())
+        maximum = int(non_null.max())
+    except (TypeError, ValueError, OverflowError):
+        return "NUMERIC(19,0)"
+
+    if -(2**31) <= minimum and maximum <= 2**31 - 1:
+        return "INTEGER"
+    return "NUMERIC(19,0)"
+
+
+def infer_access_type(
+    series: pd.Series,
+    *,
+    force_short_text: bool = False,
+) -> str:
     from pandas.api import types as ptypes
 
     dtype = series.dtype
 
     if ptypes.is_bool_dtype(dtype):
-        return "YESNO"
+        return "BIT"
     if ptypes.is_integer_dtype(dtype):
-        # DECIMAL is safer than Access INTEGER for PostgreSQL bigint values.
-        return "DECIMAL(19,0)"
+        return infer_access_integer_type(series)
     if ptypes.is_float_dtype(dtype):
         return "DOUBLE"
     if ptypes.is_datetime64_any_dtype(dtype):
@@ -269,19 +296,26 @@ def infer_access_type(series: pd.Series) -> str:
 
     sample = first_non_null(series)
     if sample is None:
-        return "LONGTEXT"
+        return "VARCHAR(255)" if force_short_text else "LONGTEXT"
     if isinstance(sample, bool):
-        return "YESNO"
+        return "BIT"
     if isinstance(sample, int) and not isinstance(sample, bool):
-        return "DECIMAL(19,0)"
+        if -(2**31) <= sample <= 2**31 - 1:
+            return "INTEGER"
+        return "NUMERIC(19,0)"
     if isinstance(sample, float):
         return "DOUBLE"
     if isinstance(sample, Decimal):
-        return "DECIMAL(28,10)"
+        return "NUMERIC(28,10)"
     if isinstance(sample, (datetime, date, time, pd.Timestamp)):
         return "DATETIME"
     if isinstance(sample, (bytes, bytearray, memoryview)):
         return "LONGBINARY"
+
+    # Access cannot use Long Text / Memo fields as ordinary index keys.
+    # Text columns explicitly used in indexes are created as Short Text.
+    if force_short_text:
+        return "VARCHAR(255)"
     return "LONGTEXT"
 
 
@@ -375,6 +409,31 @@ def validate_requested_columns(
         )
 
 
+def collect_indexed_columns(
+    normal_specs: Sequence[str],
+    unique_specs: Sequence[str],
+    primary_key: str | None,
+) -> set[str]:
+    columns: set[str] = set()
+
+    if primary_key:
+        columns.update(
+            value.strip().casefold()
+            for value in primary_key.split(",")
+            if value.strip()
+        )
+
+    for number, spec in enumerate(normal_specs, start=1):
+        _, parsed_columns = parse_index_spec(spec, "idx", number)
+        columns.update(column.casefold() for column in parsed_columns)
+
+    for number, spec in enumerate(unique_specs, start=1):
+        _, parsed_columns = parse_index_spec(spec, "uidx", number)
+        columns.update(column.casefold() for column in parsed_columns)
+
+    return columns
+
+
 def create_access_indexes(
     cursor: Any,
     table_name: str,
@@ -432,6 +491,11 @@ def export_accdb(
     total_rows = 0
     created = False
     columns: list[str] = []
+    indexed_columns = collect_indexed_columns(
+        normal_specs=index_specs,
+        unique_specs=unique_index_specs,
+        primary_key=primary_key,
+    )
 
     try:
         exists = access_table_exists(cursor, table_name)
@@ -468,13 +532,25 @@ def export_accdb(
                 columns = frame_columns
                 definitions = ", ".join(
                     f"{quote_access_identifier(column)} "
-                    f"{infer_access_type(frame[column])}"
+                    f"{infer_access_type(
+                        frame[column],
+                        force_short_text=column.casefold() in indexed_columns,
+                    )}"
                     for column in columns
                 )
-                cursor.execute(
+                create_table_sql = (
                     f"CREATE TABLE {quote_access_identifier(table_name)} "
                     f"({definitions})"
                 )
+                print("Access DDL:")
+                print(create_table_sql)
+                try:
+                    cursor.execute(create_table_sql)
+                except Exception as exc:
+                    raise ExportError(
+                        "Access rejected the generated CREATE TABLE statement. "
+                        f"DDL: {create_table_sql}"
+                    ) from exc
                 connection.commit()
                 created = True
             else:
@@ -794,7 +870,8 @@ def main() -> int:
         eprint("\nCancelled.")
         return 130
     except Exception as exc:
-        eprint(f"UNEXPECTED ERROR: {type(exc).__name__}: {exc}")
+        eprint(f"UNEXPECTED ERROR: {type(exc).__name__}: {exc!r}")
+        traceback.print_exc()
         return 1
 
 

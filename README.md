@@ -146,3 +146,11 @@ Indexes in PostgreSQL still matter for the export query itself. Add them to
 columns used in `WHERE`, `JOIN`, and sometimes `ORDER BY`. They are not copied
 into Tableau or into SAV. Access indexes are separate objects created in the
 generated `.accdb`.
+
+
+## Version 2 note
+
+Text columns explicitly used by `--index`, `--unique-index`, or
+`--primary-key` are created as Access `VARCHAR(255)` instead of Long Text.
+This is required because Long Text / Memo columns cannot be used as ordinary
+Access index keys. Other text columns remain Long Text.
