@@ -2,3 +2,4 @@
 *.laccdb
 *.sav
 *.7z
+/.venv
